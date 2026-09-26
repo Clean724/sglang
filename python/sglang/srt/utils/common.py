@@ -2834,7 +2834,17 @@ def set_gpu_proc_affinity(
     tp_size: int,
     nnodes: int,
     gpu_id: int,
+    tp_rank: int,
 ):
+    """Bind the calling scheduler task within its current allowed CPU set.
+
+    Other existing threads keep their own affinity. Separate workers may have
+    different allowed sets, so this local partition does not promise global
+    CPU exclusivity across workers.
+    """
+    if pp_size <= 0 or tp_size <= 0 or nnodes <= 0:
+        raise ValueError("PP size, TP size, and node count must be positive")
+
     # current process
     pid = os.getpid()
     p = psutil.Process(pid)
@@ -2854,9 +2864,9 @@ def set_gpu_proc_affinity(
             f"{len(allowed_cpu_ids)} available CPUs"
         )
 
-    # Distribute any remainder across the first ranks. DP groups reuse the
-    # same partitions, as in the previous gpu_id modulo mapping.
-    local_rank = gpu_id % tp_size_per_node
+    # Device IDs may be spaced by gpu_id_step or reindexed to zero in each
+    # worker. The TP rank identifies the worker's CPU partition in both cases.
+    local_rank = tp_rank % tp_size_per_node
     cores_per_rank, remainder = divmod(len(allowed_cpu_ids), tp_size_per_node)
     start = local_rank * cores_per_rank + min(local_rank, remainder)
     end = start + cores_per_rank + (local_rank < remainder)
