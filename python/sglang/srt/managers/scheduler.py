@@ -5129,15 +5129,21 @@ def configure_scheduler_process(
     configure_logger(server_args, prefix=prefix)
     suppress_other_loggers()
 
-    # Set cpu affinity to this gpu process
-    if envs.SGLANG_SET_CPU_AFFINITY.get():
-        set_gpu_proc_affinity(
-            configured_pp_size(), configured_tp_size(), get_parallel().nnodes, gpu_id
-        )
     if not envs.SGLANG_NUMA_BIND_V2.get():
         numa_node = get_numa_node_if_available(server_args, gpu_id)
         if numa_node is not None:
             numa_bind_to_node(numa_node)
+
+    # Bind after any in-process NUMA selection so readback reflects the final
+    # affinity of the scheduler's calling task.
+    if envs.SGLANG_SET_CPU_AFFINITY.get():
+        set_gpu_proc_affinity(
+            configured_pp_size(),
+            configured_tp_size(),
+            get_parallel().nnodes,
+            gpu_id,
+            tp_rank,
+        )
 
     return dp_rank
 
