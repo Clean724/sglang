@@ -2842,27 +2842,35 @@ def set_gpu_proc_affinity(
     nnodes_per_tp_group = max(nnodes // pp_size, 1)
     tp_size_per_node = tp_size // nnodes_per_tp_group
 
-    # total physical cores
-    total_pcores = psutil.cpu_count(logical=False)
-    # physical cores per TP (N.B. more Cores than GPUs on node)
-    num_cores_bind = total_pcores // tp_size_per_node
+    if tp_size_per_node <= 0:
+        raise ValueError(f"Invalid TP size per node: {tp_size_per_node}")
 
-    # able to handle multiple DP per node
-    start_cpu_id = (gpu_id * num_cores_bind) % total_pcores
-    end_cpu_id = start_cpu_id + num_cores_bind
+    # Use the CPUs actually available to this process. CPU IDs may be sparse
+    # inside a container, so ranges derived from the host CPU count are unsafe.
+    allowed_cpu_ids = sorted(p.cpu_affinity())
+    if len(allowed_cpu_ids) < tp_size_per_node:
+        raise ValueError(
+            f"Cannot bind {tp_size_per_node} TP ranks to "
+            f"{len(allowed_cpu_ids)} available CPUs"
+        )
 
-    if psutil.cpu_count() != psutil.cpu_count(logical=False):
-        # HT on
-        lower_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
-        upper_cpu_ids = [id + total_pcores for id in range(start_cpu_id, end_cpu_id)]
-        bind_cpu_ids = list(itertools.chain(lower_cpu_ids, upper_cpu_ids))
-    else:
-        # HT off
-        bind_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
+    # Distribute any remainder across the first ranks. DP groups reuse the
+    # same partitions, as in the previous gpu_id modulo mapping.
+    local_rank = gpu_id % tp_size_per_node
+    cores_per_rank, remainder = divmod(len(allowed_cpu_ids), tp_size_per_node)
+    start = local_rank * cores_per_rank + min(local_rank, remainder)
+    end = start + cores_per_rank + (local_rank < remainder)
+    bind_cpu_ids = allowed_cpu_ids[start:end]
 
     # set cpu_affinity to current process
     p.cpu_affinity(bind_cpu_ids)
-    logger.info(f"Process {pid} gpu_id {gpu_id} is running on CPUs: {p.cpu_affinity()}")
+    bound_cpu_ids = p.cpu_affinity()
+    if sorted(bound_cpu_ids) != bind_cpu_ids:
+        raise RuntimeError(
+            f"CPU affinity changed while binding gpu_id {gpu_id}: "
+            f"requested {bind_cpu_ids}, got {bound_cpu_ids}"
+        )
+    logger.info(f"Process {pid} gpu_id {gpu_id} is running on CPUs: {bound_cpu_ids}")
 
 
 def permute_weight(x: torch.Tensor) -> torch.Tensor:
