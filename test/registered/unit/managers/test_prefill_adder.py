@@ -102,6 +102,10 @@ class TestPrefillAdder(CustomTestCase):
         req.storage_hit_length = 0
         req.finished.return_value = False
         req.needs_host_load_back.return_value = False
+        # Keep the mock's range state consistent with the production Req API.
+        req.set_extend_range.side_effect = lambda start, end: Req.set_extend_range(
+            req, start, end
+        )
         return req
 
     def create_adder(self, running_batch, **kwargs):
@@ -889,6 +893,86 @@ class TestPrefillAdder(CustomTestCase):
                 size_swa=4096, sliding_window=128
             )._swa_req_never_fits(**req)
         )
+
+    def test_s1_actual_tokens_keep_paged_budget(self):
+        for actual, paged in ((0, 0), (3, 128), (128, 128), (129, 256)):
+            with self.subTest(actual=actual):
+                adder = self.create_adder(None, page_size=128)
+                adder._update_prefill_budget(0, actual, 8, False)
+                self.assertEqual(adder.log_input_tokens, actual)
+                self.assertEqual(adder.reprocessed_log_input_tokens, 0)
+                self.assertEqual(adder.rem_input_tokens, 10000 - paged)
+                self.assertEqual(adder.cur_rem_token_offset, paged + 128)
+                self.assertEqual(adder.rem_total_token_offset, paged + 128 + 8)
+
+    def test_s1_nonchunked_admission_records_actual_range(self):
+        for actual, paged in ((3, 128), (128, 128), (129, 256)):
+            with self.subTest(actual=actual):
+                adder = self._create_delayer_adder(
+                    available_tokens=100000, delayer=None, page_size=128
+                )
+                req = self._create_delayer_req(actual)
+                result = adder.add_one_req(req, False, None)
+                self.assertEqual(result, AddReqResult.CONTINUE)
+                self.assertEqual(req.extend_range.length, actual)
+                self.assertIn(req, adder.can_run_list)
+                self.assertEqual(adder.log_input_tokens, actual)
+                self.assertEqual(adder.rem_input_tokens, 10000 - paged)
+                self.assertEqual(adder.cur_rem_token_offset, paged + 128)
+                self.assertEqual(adder.rem_total_token_offset, paged + 136)
+
+    def test_s1_mixed_reprocessed_tokens_and_prefix_tiers(self):
+        adder = self.create_adder(None, page_size=128)
+        adder._update_prefill_budget(12, 3, 8, False, host_hit_len=8, storage_hit_len=3)
+        adder._update_prefill_budget(5, 129, 8, True)
+        self.assertEqual(adder.log_input_tokens, 132)
+        self.assertEqual(adder.reprocessed_log_input_tokens, 129)
+        self.assertEqual(adder.log_hit_tokens, 17)
+        self.assertEqual(adder.reprocessed_log_hit_tokens, 5)
+        self.assertEqual(
+            (
+                adder.log_device_hit_tokens,
+                adder.log_host_hit_tokens,
+                adder.log_storage_hit_tokens,
+            ),
+            (4, 5, 3),
+        )
+        self.assertEqual(adder.rem_input_tokens, 10000 - 384)
+        self.assertEqual(adder.cur_rem_token_offset, 384 + 256)
+
+    def test_s1_chunk_budget_stays_paged(self):
+        adder = self.create_adder(None, page_size=128, rem_chunk_tokens=1024)
+        adder._update_prefill_budget(0, 3, 8, False)
+        self.assertEqual(adder.log_input_tokens, 3)
+        self.assertEqual(adder.rem_chunk_tokens, 896)
+
+    def test_s1_dllm_budget_stays_paged(self):
+        adder = self.create_adder(
+            None,
+            page_size=128,
+            dllm_config=SimpleNamespace(block_size=1024, max_running_requests=2),
+        )
+        adder._update_prefill_budget(0, 129, 8, False)
+        self.assertEqual(adder.log_input_tokens, 129)
+        self.assertEqual(adder.rem_dllm_tokens, 1792)
+
+    def test_s1_mamba_reservation_unchanged(self):
+        adder = self.create_adder(None, page_size=128)
+        adder.rem_mamba_slots = 4
+        adder._update_prefill_budget(0, 3, 8, False, mamba_gap_reserve=256)
+        self.assertEqual(adder.log_input_tokens, 3)
+        self.assertEqual(adder.rem_mamba_slots, 3)
+        self.assertEqual(adder.cur_rem_token_offset, 512)
+        self.assertEqual(adder.rem_total_token_offset, 520)
+
+    def test_s1_hybrid_swa_budget_receives_paged_length(self):
+        adder = self.create_adder(None, page_size=128)
+        adder.is_hybrid_swa = True
+        with patch.object(adder, "_swa_budget_for_req", return_value=264) as budget:
+            adder._update_prefill_budget(0, 129, 8, False)
+        budget.assert_called_once_with(256, 8)
+        self.assertEqual(adder.log_input_tokens, 129)
+        self.assertEqual(adder.rem_swa_token_offset, 264)
 
 
 if __name__ == "__main__":
